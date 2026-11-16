@@ -1,0 +1,310 @@
+// ====== SET THIS after deploying Tallio.sol on Sepolia ======
+const ADDR = "0xa8e472C6fC6cF19419A7202C6b0ADC6208818a6a";
+// ==========================================================
+const ABI = [
+ "function createPoll(string,string,string[],uint64) returns (uint256)",
+ "function vote(uint256,uint256)",
+ "function closePoll(uint256)",
+ "function owner() view returns (address)",
+ "function pollCount() view returns (uint256)",
+ "function getPoll(uint256) view returns (tuple(string question,string description,string[] options,uint256[] votes,address creator,uint64 endTime,uint256 total))",
+ "function hasVoted(uint256,address) view returns (bool)",
+ "function choiceOf(uint256,address) view returns (uint256)",
+ "event PollCreated(uint256 indexed id,address indexed creator,string question,uint64 endTime)",
+ "event Voted(uint256 indexed id,address indexed voter,uint256 option)",
+ "event PollClosed(uint256 indexed id)"];
+const HTTP="https://ethereum-sepolia-rpc.publicnode.com", WS="wss://ethereum-sepolia-rpc.publicnode.com", SCAN="https://sepolia.etherscan.io";
+const {ethers}=window, $=(s,r=document)=>r.querySelector(s), $$=(s,r=document)=>[...r.querySelectorAll(s)];
+const http=new ethers.JsonRpcProvider(HTTP,11155111,{staticNetwork:true}), ro=new ethers.Contract(ADDR,ABI,http);
+const S={polls:new Map(),sel:null,me:null,owner:null,signer:null,f:"all",s:"new",q:"",feed:[],pick:null,live:false,wsAt:0,prev:{},openN:-1,nopts:["",""],loaded:false,blocks:[],v:"home",w:0};
+const CONFIGURED=ethers.isAddress(ADDR);
+const isAdmin=()=>!!(S.me&&S.owner&&S.me.toLowerCase()===S.owner.toLowerCase());
+const short=a=>a.slice(0,6)+"…"+a.slice(-4);
+const esc=s=>String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const now=()=>Date.now()/1000, isOpen=p=>p.end>now();
+const left=s=>{if(s<=0)return"Ended";const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60),x=Math.floor(s%60);return d?`${d}d ${h}h left`:h?`${h}h ${m}m left`:`${m}m ${String(x).padStart(2,"0")}s left`};
+function toast(m,ms=4500){const t=$("#toast");t.innerHTML=m;t.style.display="block";clearTimeout(t.h);t.h=setTimeout(()=>t.style.display="none",ms)}
+function sched(){if(!sched.t)sched.t=requestAnimationFrame(()=>{sched.t=0;paint()})}
+
+/* ---------- data ---------- */
+async function fetchPoll(id){
+  const r=await ro.getPoll(id);
+  const p={id,q:r.question,d:r.description,opts:[...r.options],votes:[...r.votes].map(Number),creator:r.creator,end:Number(r.endTime),total:Number(r.total),voted:false,choice:-1};
+  if(S.me){p.voted=await ro.hasVoted(id,S.me);if(p.voted)p.choice=Number(await ro.choiceOf(id,S.me))}
+  const old=S.polls.get(id); if(old&&old.pending)return;
+  S.polls.set(id,p);sched();
+}
+async function sync(){
+  if(!CONFIGURED){S.loaded=true;sched();return}
+  try{S.owner=await ro.owner();const n=Number(await ro.pollCount());await Promise.all([...Array(n).keys()].map(fetchPoll));}
+  catch(e){toast("Could not read the contract. Check the address and that it is on Sepolia.",8000)}
+  S.loaded=true;sched();
+}
+async function history(){
+  if(!CONFIGURED)return;
+  try{const head=await http.getBlockNumber(),from=head-3000;
+   const [v,c]=await Promise.all([ro.queryFilter("Voted",from,head),ro.queryFilter("PollCreated",from,head)]);
+   const items=[...v.map(e=>({k:"vote",id:Number(e.args[0]),voter:e.args[1],opt:Number(e.args[2]),bn:e.blockNumber})),
+    ...c.map(e=>({k:"new",id:Number(e.args[0]),creator:e.args[1],q:e.args[2],bn:e.blockNumber}))].sort((a,b)=>a.bn-b.bn);
+   items.forEach(i=>S.feed.unshift(i));S.feed=S.feed.slice(0,40);sched();}catch{}
+}
+
+/* ---------- live ---------- */
+let W;
+function setBlock(n){n=Number(n);if(S.blocks[0]!==n){S.blocks.unshift(n);S.blocks=S.blocks.slice(0,9);if(S.v==="home")sched()}S.wsAt=Date.now();$("#blk").textContent="Block "+Number(n).toLocaleString();setLive(true)}
+function setLive(v){S.live=v;$("#liveDot").classList.toggle("on",v)}
+function goLive(){
+  try{
+    W=new ethers.WebSocketProvider(WS);W.on("block",setBlock);
+    if(!CONFIGURED)return;
+    const c=new ethers.Contract(ADDR,ABI,W);
+    c.on("Voted",(id,voter,opt)=>{S.feed.unshift({k:"vote",id:Number(id),voter,opt:Number(opt)});S.feed=S.feed.slice(0,40);fetchPoll(Number(id)).catch(()=>{})});
+    c.on("PollCreated",(id,creator,q)=>{S.feed.unshift({k:"new",id:Number(id),creator,q});fetchPoll(Number(id)).catch(()=>{})});
+    c.on("PollClosed",id=>fetchPoll(Number(id)).catch(()=>{}));
+  }catch{setLive(false)}
+}
+setInterval(async()=>{
+  if(Date.now()-S.wsAt>45000){setLive(false);try{W&&W.destroy()}catch{}goLive();
+    try{setBlock(await http.getBlockNumber());S.live=false;$("#liveDot").classList.remove("on")}catch{}}
+  if(!S.live||document.visibilityState==="visible"&&Date.now()%60000<12000)sync();
+},12000);
+document.addEventListener("visibilitychange",()=>{if(!document.hidden)sync()});
+
+/* ---------- wallet ---------- */
+const off=()=>{try{return localStorage.getItem("tallio_off")==="1"}catch{return false}};
+const setOff=v=>{try{v?localStorage.setItem("tallio_off","1"):localStorage.removeItem("tallio_off")}catch{}};
+async function connect(){
+  if(!window.ethereum)return toast("No wallet found. Install MetaMask to vote.");
+  setOff(false);
+  try{
+    try{await ethereum.request({method:"wallet_switchEthereumChain",params:[{chainId:"0xaa36a7"}]})}
+    catch(e){if(e.code===4902)await ethereum.request({method:"wallet_addEthereumChain",params:[{chainId:"0xaa36a7",chainName:"Sepolia",rpcUrls:[HTTP],nativeCurrency:{name:"Sepolia ETH",symbol:"ETH",decimals:18},blockExplorerUrls:[SCAN]}]});else throw e}
+    await setSigner();
+  }catch(e){toast("Could not connect: "+(e.shortMessage||e.message))}
+}
+async function setSigner(){
+  const bp=new ethers.BrowserProvider(ethereum);S.signer=await bp.getSigner();S.me=await S.signer.getAddress();
+  await sync();sched();
+}
+/* ---------- account menu + disconnect ---------- */
+const menu=document.createElement("div");menu.id="acct";menu.hidden=true;
+menu.innerHTML='<div class="am-addr" id="amAddr"></div><button data-am="copy">Copy address</button><button data-am="out" class="danger">Disconnect</button>';
+document.body.appendChild(menu);
+function toggleMenu(open){
+  const want=open===undefined?menu.hidden:open;
+  if(want&&S.me){const r=$("#connect").getBoundingClientRect();menu.style.top=(r.bottom+8)+"px";menu.style.right=Math.max(8,innerWidth-r.right)+"px";$("#amAddr").textContent=S.me}
+  menu.hidden=!(want&&S.me);
+}
+async function disconnect(){
+  try{await ethereum.request({method:"wallet_revokePermissions",params:[{eth_accounts:{}}]})}catch{}
+  setOff(true);S.me=null;S.signer=null;S.pick=null;
+  S.polls.forEach(p=>{p.voted=false;p.choice=-1});
+  toggleMenu(false);toast("Wallet disconnected");sched();
+}
+$("#connect").onclick=()=>S.me?toggleMenu():connect();
+menu.onclick=e=>{const b=e.target.closest("[data-am]");if(!b)return;
+  if(b.dataset.am==="copy"){navigator.clipboard?.writeText(S.me);toast("Address copied");toggleMenu(false)}
+  else disconnect()};
+document.addEventListener("click",e=>{if(!e.target.closest("#acct,#connect"))toggleMenu(false)});
+addEventListener("keydown",e=>{if(e.key==="Escape")toggleMenu(false)});
+/* ripple on buttons */
+document.addEventListener("pointerdown",e=>{
+  const b=e.target.closest(".btn,.chip,.nav button,.item,.opt,.ico");if(!b||b.disabled)return;
+  const r=b.getBoundingClientRect(),d=Math.max(r.width,r.height)*2,i=document.createElement("i");
+  i.className="rip";i.style.cssText=`width:${d}px;height:${d}px;left:${e.clientX-r.left-d/2}px;top:${e.clientY-r.top-d/2}px`;
+  b.appendChild(i);setTimeout(()=>i.remove(),650);
+});
+if(window.ethereum){
+  if(!off())ethereum.request({method:"eth_accounts"}).then(a=>a.length&&setSigner()).catch(()=>{});
+  ethereum.on?.("accountsChanged",a=>{S.me=null;S.signer=null;S.polls.forEach(p=>{p.voted=false;p.choice=-1});toggleMenu(false);a.length&&!off()?setSigner():sched()});
+  ethereum.on?.("chainChanged",()=>location.reload());
+}
+async function send(label,fn){
+  if(!CONFIGURED)throw new Error("Contract address not set in index.html");
+  const t=await fn(new ethers.Contract(ADDR,ABI,S.signer));
+  toast(`${label}… waiting for confirmation`,90000);await t.wait();toast(`${label}: confirmed ✓`,6000);
+}
+
+/* ---------- actions ---------- */
+function burst(el){const r=el.getBoundingClientRect(),x=r.left+r.width/2,y=r.top+r.height/2;
+  for(let i=0;i<22;i++){const e=document.createElement("i"),a=Math.random()*6.28,d=40+Math.random()*90;e.className="spark";
+    e.style.cssText=`left:${x}px;top:${y}px;background:${i%2?"var(--acc)":"var(--a2)"};--x:${Math.cos(a)*d}px;--y:${Math.sin(a)*d}px`;document.body.appendChild(e);setTimeout(()=>e.remove(),900)}}
+async function cast(){
+  const p=S.polls.get(S.sel),i=S.pick;if(i==null||!p)return;
+  if(!S.signer){await connect();if(!S.signer)return}
+  burst($("#cast")||document.body);
+  const snap={...p,votes:[...p.votes]};
+  p.votes[i]++;p.total++;p.voted=true;p.choice=i;p.pending=true;S.pick=null;sched();
+  try{await send("Vote",c=>c.vote(p.id,i))}
+  catch(e){Object.assign(p,snap);toast("Vote failed: "+(e.reason||e.shortMessage||e.message),7000)}
+  finally{delete p.pending;fetchPoll(p.id).catch(()=>{})}
+}
+async function closeIt(){
+  const p=S.polls.get(S.sel);
+  try{await send("Ending poll",c=>c.closePoll(p.id));await fetchPoll(p.id)}catch(e){toast("Failed: "+(e.reason||e.shortMessage||e.message),7000)}
+}
+function select(id){S.v="polls";S.sel=id;S.pick=null;if(location.hash!=="#p"+id)location.hash="p"+id;sched()}
+const VIEWS=["home","polls","results","create","mine","watch"],go=v=>{location.hash=v};
+function fromHash(){const h=location.hash.slice(1),m=/^p(\d+)$/.exec(h);
+  if(m){S.v="polls";S.sel=+m[1]}else{S.v=VIEWS.includes(h)?h:"home";if(h==="polls"&&innerWidth<=820)S.sel=null}
+  S.pick=null;sched()}
+addEventListener("hashchange",fromHash);
+
+/* ---------- render ---------- */
+function visible(){
+  let a=[...S.polls.values()];const t=now();
+  if(S.q)a=a.filter(p=>p.q.toLowerCase().includes(S.q));
+  if(S.f==="open")a=a.filter(p=>p.end>t);if(S.f==="ended")a=a.filter(p=>p.end<=t);if(S.f==="voted")a=a.filter(p=>p.voted);
+  const f={new:(x,y)=>y.id-x.id,hot:(x,y)=>y.total-x.total,soon:(x,y)=>(x.end>t?x.end:9e12)-(y.end>t?y.end:9e12)}[S.s];
+  return a.sort(f);
+}
+function paint(){
+  $("#new").hidden=!isAdmin();$("#setup").hidden=CONFIGURED;
+  {const cb=$("#connect"),t=S.me?short(S.me)+" ▾":"Connect wallet";if(cb.firstChild?.nodeValue!==t)cb.firstChild?cb.firstChild.nodeValue=t:cb.prepend(t);cb.classList.toggle("on",!!S.me)}
+  const rl=$("#role");rl.textContent=!S.me?"Guest":isAdmin()?"Admin":"Voter";rl.style.color=isAdmin()?"var(--acc)":"";rl.style.borderColor=isAdmin()?"var(--acc)":"";
+  const all=[...S.polls.values()],open=all.filter(isOpen).length,votes=all.reduce((a,p)=>a+p.total,0);
+  [["sOpen",open],["sVotes",votes],["sPolls",all.length]].forEach(([id,v])=>{const e=$("#"+id);if(e.textContent!=v){e.textContent=v;e.classList.remove("tick");void e.offsetWidth;e.classList.add("tick")}});
+  S.openN=open;
+  pages();if(S.v!=="polls")return;
+  const arr=visible();
+  if(S.sel==null&&arr.length&&innerWidth>820)S.sel=arr[0].id;
+  document.body.dataset.view=S.sel!=null?"detail":"list";
+  $("#list").innerHTML=!S.loaded?'<div class="sk"></div><div class="sk"></div><div class="sk"></div>':arr.map(p=>{
+    const mx=Math.max(0,...p.votes),pct=p.total?mx*100/p.total:0,bump=S.prev[p.id]!==undefined&&S.prev[p.id]!==p.total;S.prev[p.id]=p.total;
+    return `<button class="item ${p.id===S.sel?"sel":""} ${bump?"bump":""}" data-id="${p.id}"><div class="t">${esc(p.q)}</div>
+    <div class="m"><i class="dot ${isOpen(p)?"on":""}"></i><span data-end="${p.end}">${left(p.end-now())}</span><span>${p.total} vote${p.total===1?"":"s"}</span>${p.voted?"<span>✓ voted</span>":""}</div>
+    <div class="mini"><i style="width:${pct}%"></i></div></button>`}).join("")||`<div class="empty">${S.polls.size?"No polls match your filters.":isAdmin()?"No polls yet. Create the first one.":"No polls yet."}</div>`;
+  $("#feed").innerHTML=S.feed.slice(0,25).map(f=>{const p=S.polls.get(f.id);
+    return f.k==="vote"?`<li><b>${short(f.voter)}</b> voted “${esc(p?.opts[f.opt]??"…")}” on <a href="#p${f.id}">#${f.id}</a></li>`:`<li><b>${short(f.creator)}</b> created <a href="#p${f.id}">#${f.id}</a> “${esc(f.q)}”</li>`}).join("")||"<li>Waiting for activity…</li>";
+  detail();
+}
+function detail(){
+  const el=$("#detail"),p=S.polls.get(S.sel);
+  if(!p){el.dataset.sig="";el.innerHTML=!S.loaded?"":S.polls.size?'<div class="empty">Select a poll to see live results.</div>':`<div class="empty"><h2>No polls yet</h2><p>${isAdmin()?"You’re the admin. Publish the first poll, then share its link so others can vote.":S.me?"Only the admin can publish polls. Check back soon.":"Connect your wallet to vote or, if you deployed this, to manage polls."}</p>${isAdmin()?'<button class="btn" id="new2">Create a poll</button>':!S.me?'<button class="btn" id="conn2">Connect wallet</button>':""}</div>`;return}
+  const open=isOpen(p),sig=[p.id,p.opts.length,open,p.voted,S.pick,!!S.me,isAdmin()].join("|");
+  if(el.dataset.sig!==sig){
+    el.dataset.sig=sig;
+    const can=open&&!p.voted;
+    el.innerHTML=`<button class="btn sec back" id="back">← All polls</button>
+    <span class="pill"><i class="dot ${open?"on":""}"></i><span data-end="${p.end}">${left(p.end-now())}</span></span>
+    <h2>${esc(p.q)}</h2>${p.d?`<p class="desc">${esc(p.d)}</p>`:""}
+    <div class="by"><span>Poll #${p.id} by ${short(p.creator)}</span>
+     <button id="copy">Copy link</button>
+     ${open&&isAdmin()?'<button id="close">End poll now</button>':""}</div>
+    ${p.opts.map((o,i)=>`<button class="opt ${S.pick===i?"sel":""}" data-i="${i}" ${can?"":"disabled"}><i class="fill"></i><span>${esc(o)}${p.choice===i?' <span class="good">✓ your vote</span>':""}</span><span class="num"></span></button>`).join("")}
+    <div class="cta" id="cta"></div>`;
+    $("#cta").innerHTML=!open?'<span class="note" id="win"></span>':p.voted?`<span class="good">Vote recorded on-chain. It’s final.</span>`:!S.me?'<button class="btn" id="conn2">Connect wallet to vote</button>':`<button class="btn" id="cast" ${S.pick==null?"disabled":""}>Cast vote</button><span class="note">${S.pick==null?"Pick an option":"Selected: "+esc(p.opts[S.pick])}</span>`;
+    requestAnimationFrame(()=>patch(p));
+  }else patch(p);
+}
+function patch(p){
+  const mx=Math.max(0,...p.votes);
+  p.opts.forEach((_,i)=>{const pct=p.total?p.votes[i]*100/p.total:0,o=$(`.opt[data-i="${i}"]`);if(!o)return;
+    o.classList.toggle("lead",mx>0&&p.votes[i]===mx);$(".fill",o).style.width=pct+"%";$(".num",o).textContent=`${p.votes[i]} · ${Math.round(pct)}%`});
+  const w=$("#win");if(w)w.textContent=mx===0?"Ended with no votes.":"Winner: "+p.opts.filter((_,i)=>p.votes[i]===mx).join(" / ")+` (${p.total} vote${p.total===1?"":"s"})`;
+}
+/* 1s countdown */
+setInterval(()=>{$$("[data-end]").forEach(e=>e.textContent=left(+e.dataset.end-now()));
+  if([...S.polls.values()].filter(isOpen).length!==S.openN){$("#detail").dataset.sig="";sched()}},1000);
+
+/* ---------- pages ---------- */
+const bars=p=>{const mx=Math.max(0,...p.votes);return p.opts.map((o,i)=>{const c=p.total?Math.round(p.votes[i]*100/p.total):0;
+  return `<div class="rb ${mx>0&&p.votes[i]===mx?"lead":""}"><div class="rl"><span>${esc(o)}${p.choice===i?" ✓":""}</span><span>${p.votes[i]} · ${c}%</span></div><div class="rt"><i style="width:${c}%"></i></div></div>`}).join("")};
+const winner=p=>{const mx=Math.max(0,...p.votes);return !mx?"No votes yet":(isOpen(p)?"Leading: ":"Winner: ")+p.opts.filter((_,i)=>p.votes[i]===mx).join(" / ")};
+const emptyCard=()=>`<div class="card empty">No polls yet.<br>${isAdmin()?'<button class="btn" data-go="create">Create the first poll</button>':"The admin hasn’t published one yet."}</div>`;
+function pages(){
+  $$("#nav button").forEach(b=>b.classList.toggle("on",b.dataset.v===S.v));
+  $(".app").style.display=S.v==="polls"?"":"none";
+  $$(".page").forEach(e=>e.hidden=e.id!=="v-"+S.v);
+  ({home:pHome,results:pResults,create:pCreate,mine:pMine,watch:pWatch}[S.v]||(()=>{}))();
+}
+function pHome(){
+  const all=[...S.polls.values()],open=all.filter(isOpen),total=all.reduce((a,p)=>a+p.total,0);
+  $("#hBlocks").innerHTML=S.blocks.length?[...S.blocks].reverse().map((n,i,a)=>`<span class="blk ${i===a.length-1?"new":""}">#${n.toLocaleString()}</span>`).join(""):'<span class="note">Waiting for blocks…</span>';
+  const f=[...open].sort((a,b)=>b.total-a.total||b.id-a.id)[0]||[...all].sort((a,b)=>b.id-a.id)[0];
+  $("#hFeat").innerHTML=f?`<article class="card"><div class="rowb"><span class="pill"><i class="dot ${isOpen(f)?"on":""}"></i><span data-end="${f.end}">${left(f.end-now())}</span></span><span class="note">Poll #${f.id}</span></div><h3>${esc(f.q)}</h3><p class="note">by ${short(f.creator)}</p>${bars(f)}<div class="rowb"><span><b>${f.total}</b> total votes</span><button class="btn" data-poll="${f.id}">${isOpen(f)?"Vote now":"View results"}</button></div></article>`:emptyCard();
+  const votes=S.feed.filter(x=>x.k==="vote"),lv=votes[0],lp=lv&&S.polls.get(lv.id);
+  $("#hRecent").innerHTML=lv&&lp?`<article class="card"><div class="rowb"><b>Latest ballot</b><span class="pill">recorded</span></div><dl class="kv"><dt>Poll</dt><dd>#${lp.id} · ${esc(lp.q)}</dd><dt>Choice</dt><dd>${esc(lp.opts[lv.opt]??"…")}</dd><dt>Voter</dt><dd>${short(lv.voter)}</dd><dt>Block</dt><dd>${lv.bn?lv.bn.toLocaleString():"live"}</dd></dl></article>
+   <div>${votes.slice(1,4).map(x=>`<div class="card"><span class="pill">vote</span> <b>${short(x.voter)}</b> on <button class="lnk" data-poll="${x.id}">#${x.id}</button></div>`).join("")}</div>`:'<div class="card empty">No votes yet. Activity appears here in real time.</div>';
+  const vs=new Set(votes.map(x=>x.voter.toLowerCase()));if(S.me&&all.some(p=>p.voted))vs.add(S.me.toLowerCase());
+  $("#hStats").innerHTML=[["Active open polls",open.length],["Total votes cast",total],["Total polls created",all.length],["Voters seen recently",vs.size]].map(([l,v])=>`<div class="tile">${l}<b>${v}</b></div>`).join("");
+}
+function pResults(){
+  $("#rList").innerHTML=[...S.polls.values()].sort((a,b)=>b.id-a.id).map(p=>`<article class="card"><div class="rowb"><span class="pill"><i class="dot ${isOpen(p)?"on":""}"></i>${isOpen(p)?"Open":"Ended"}</span><button class="lnk" data-poll="${p.id}">Poll #${p.id}</button></div><h3>${esc(p.q)}</h3>${bars(p)}<div class="rowb"><span>${p.total} vote${p.total===1?"":"s"}</span><span class="note">${winner(p)}</span></div></article>`).join("")||emptyCard();
+}
+function pMine(){
+  const el=$("#mList");
+  if(!S.me){el.innerHTML='<div class="card empty">Connect your wallet to see your votes.<br><button class="btn" data-connect>Connect wallet</button></div>';return}
+  const mine=[...S.polls.values()].filter(p=>p.voted).sort((a,b)=>b.id-a.id),made=isAdmin()?[...S.polls.values()].sort((a,b)=>b.id-a.id):[];
+  el.innerHTML=(mine.map(p=>`<article class="card"><div class="rowb"><span class="good">✓ You voted: ${esc(p.opts[p.choice])}</span><button class="lnk" data-poll="${p.id}">Poll #${p.id}</button></div><h3>${esc(p.q)}</h3>${bars(p)}</article>`).join("")||'<div class="card empty">You haven’t voted yet.<br><button class="btn" data-go="polls">Browse polls</button></div>')
+   +(made.length?`<h2 style="margin-top:32px">Polls I published</h2>`+made.map(p=>`<div class="card rowb"><span>#${p.id} · ${esc(p.q)}</span><button class="lnk" data-poll="${p.id}">${p.total} votes · open</button></div>`).join(""):"");
+}
+function pCreate(){
+  $("#cform").hidden=!isAdmin();
+  $("#cgate").innerHTML=isAdmin()?"":`<div class="card empty"><h2>Admin only</h2><p>${!CONFIGURED?"The contract isn’t set up yet. Deploy Tallio.sol and put its address in index.html.":S.me?"Only the admin wallet can create polls. You can still vote on any open poll.":"Connect the admin wallet to create polls."}</p>${S.me?'<button class="btn" data-go="polls">Browse polls</button>':'<button class="btn" data-connect>Connect wallet</button>'}</div>`;
+}
+const SL=[["Admin creates a poll","The admin wallet publishes a question with 2 to 10 options and a deadline."],["Connect your wallet","No sign-up and no password. Your wallet is your identity."],["Cast one vote","Pick an option and confirm in your wallet. The contract rejects a second vote."],["Verify it yourself","Every vote is a public transaction on the blockchain, and results are read straight from the contract."]];
+function pWatch(){const [t,d]=SL[S.w];$("#wBox").innerHTML=`<div class="wn">${S.w+1} / ${SL.length}</div><h2>${t}</h2><p class="note">${d}</p>`;
+  $("#wDots").innerHTML=SL.map((_,i)=>`<button data-w="${i}" class="${i===S.w?"on":""}" aria-label="Step ${i+1}"></button>`).join("")}
+setInterval(()=>{if(S.v==="watch"&&!S.wpause){S.w=(S.w+1)%SL.length;sched()}},4500);
+$("#v-watch").onclick=e=>{const b=e.target.closest("[data-w]");if(!b)return;const v=b.dataset.w;
+  if(v==="prev")S.w=(S.w+SL.length-1)%SL.length;else if(v==="next")S.w=(S.w+1)%SL.length;else if(v==="pause"){S.wpause=!S.wpause;b.textContent=S.wpause?"Play":"Pause"}else S.w=+v;sched()};
+$("#csv").onclick=()=>{const rows=[["poll","question","option","votes","percent"]];
+  [...S.polls.values()].forEach(p=>p.opts.forEach((o,i)=>rows.push([p.id,p.q,o,p.votes[i],p.total?Math.round(p.votes[i]*100/p.total):0])));
+  const a=document.createElement("a");a.href=URL.createObjectURL(new Blob([rows.map(r=>r.map(c=>`"${String(c).replace(/"/g,'""')}"`).join(",")).join("\n")],{type:"text/csv"}));a.download="tallio-results.csv";a.click()};
+$("#nav").onclick=e=>{const b=e.target.closest("button");if(b)go(b.dataset.v)};
+document.addEventListener("click",e=>{const t=e.target;let b;
+  if(b=t.closest("[data-go]"))go(b.dataset.go);else if(b=t.closest("[data-poll]"))select(+b.dataset.poll);else if(t.closest("[data-connect]"))connect()});
+/* live ticker under the header */
+let tkAt=0;
+function ticker(){
+  const it=[...S.polls.values()].sort((a,b)=>b.id-a.id).slice(0,3).map(p=>`<span><b>#${p.id}</b>${esc(p.q)} · ${p.total} vote${p.total===1?"":"s"} · ${isOpen(p)?"open":"ended"}</span>`);
+  S.feed.slice(0,4).forEach(f=>it.push(f.k==="vote"?`<span><b>VOTE</b>${short(f.voter)} on #${f.id}</span>`:`<span><b>NEW</b>poll #${f.id}</span>`));
+  S.blocks.slice(0,3).forEach(n=>it.push(`<span><b>BLOCK</b>#${n.toLocaleString()}</span>`));
+  if(!it.length)it.push("<span>Waiting for the first poll…</span>");
+  const h=it.join(""),d=Math.max(24,it.length*7),k=$("#tkIn");
+  k.innerHTML=h+h;k.style.animationDuration=d+"s";k.style.animationDelay=-(Date.now()/1000%d)+"s";
+}
+setInterval(()=>{if(Date.now()-tkAt>8000){tkAt=Date.now();ticker()}},1000);
+
+/* ---------- events ---------- */
+$("#list").onclick=e=>{const b=e.target.closest("[data-id]");if(b)select(+b.dataset.id)};
+$("#detail").onclick=e=>{
+  const t=e.target,o=t.closest(".opt");
+  if(o&&!o.disabled){S.pick=+o.dataset.i;sched()}
+  else if(t.id==="cast")cast();else if(t.id==="conn2")connect();else if(t.id==="close")closeIt();else if(t.id==="new2")$("#new").click();
+  else if(t.id==="back"){S.sel=null;go("polls")}
+  else if(t.id==="copy"){navigator.clipboard?.writeText(location.origin+location.pathname+"#p"+S.sel);toast("Link copied")}
+};
+$("#feed").onclick=e=>{if(e.target.matches("a")){e.preventDefault();select(+e.target.getAttribute("href").slice(2))}};
+$("#search").oninput=e=>{S.q=e.target.value.trim().toLowerCase();sched()};
+$("#sort").onchange=e=>{S.s=e.target.value;sched()};
+$("#chips").onclick=e=>{const c=e.target.closest(".chip");if(!c)return;S.f=c.dataset.f;$$(".chip").forEach(x=>x.classList.toggle("on",x===c));sched()};
+addEventListener("keydown",e=>{if(e.key==="/"&&!/INPUT|TEXTAREA/.test(document.activeElement.tagName)){e.preventDefault();$("#search").focus()}});
+
+/* create dialog with live preview */
+function drawOpts(){
+  $("#nopts").innerHTML=S.nopts.map((v,i)=>`<div class="orow"><input data-o="${i}" value="${esc(v)}" maxlength="80" placeholder="Option ${i+1}" aria-label="Option ${i+1}">${S.nopts.length>2?`<button class="btn sec" data-rm="${i}" aria-label="Remove option">✕</button>`:""}</div>`).join("");
+  $("#addOpt").disabled=S.nopts.length>=10;preview();
+}
+function preview(){
+  const o=S.nopts.filter(x=>x.trim()),q=$("#nq").value.trim();
+  $("#prev").innerHTML=`<b>${esc(q||"Your question")}</b><br>${o.length?o.map(esc).join(" · "):"Add at least two options"}<br>${o.length>=2&&q?'<span class="good">Ready to publish</span>':"Needs a question and 2+ options"}`;
+  $("#submit").disabled=!(o.length>=2&&q);
+}
+function resetForm(){S.nopts=["",""];$("#nq").value="";$("#nd").value="";drawOpts()}
+$("#new").onclick=()=>{resetForm();go("create")};
+$("#addOpt").onclick=()=>{S.nopts.push("");drawOpts();$$("#nopts input").pop().focus()};
+$("#nq").oninput=preview;
+$("#nopts").oninput=e=>{if(e.target.dataset.o!==undefined){S.nopts[+e.target.dataset.o]=e.target.value;preview()}};
+$("#nopts").onclick=e=>{const r=e.target.closest("[data-rm]");if(r){S.nopts.splice(+r.dataset.rm,1);drawOpts()}};
+$("#submit").onclick=async()=>{
+  if(!S.signer){await connect();if(!S.signer)return}
+  const o=S.nopts.map(x=>x.trim()).filter(Boolean);$("#submit").disabled=true;
+  try{await send("Creating poll",c=>c.createPoll($("#nq").value.trim(),$("#nd").value.trim(),o,BigInt($("#ndur").value)));await sync();select(Math.max(...S.polls.keys()));resetForm();toast("Poll published. Use Copy link to invite voters.",7000)}
+  catch(e){toast("Failed: "+(e.reason||e.shortMessage||e.message),7000)}
+  preview();
+};
+
+resetForm();fromHash();sync();history();goLive();
+http.getBlockNumber().then(setBlock).catch(()=>{S.live=false;$("#liveDot").classList.remove("on")});
